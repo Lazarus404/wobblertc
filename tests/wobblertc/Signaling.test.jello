@@ -1,0 +1,104 @@
+package wobblertc;
+
+import type { Test } from std.testing;
+import std.testing as T;
+import std.concurrent.Process as Process;
+import std.io.Command as Command;
+import std.io.File as File;
+import std.net.Tcp as Tcp;
+import { Protocol, protocol } from wobblertc.Signaling;
+import { Peer } from wobblertc.Peer;
+
+let cannotConnect = "Peer.signal: cannot connect to the server";
+
+// What BODY throws, or "" when it does not.
+let thrown = fn(body: () -> Null): Bytes {
+  try { body(); "" } catch (e) { e as Bytes }
+};
+
+// Two ports of this machine that nothing listens on: ports two listeners had, now closed.
+let freePorts = fn(): Tuple<I32, I32> {
+  let one = Tcp.listen("127.0.0.1", 0);
+  let two = Tcp.listen("127.0.0.1", 0);
+  let ports = (one.port(), two.port());
+  one.close();
+  two.close();
+  ports
+};
+
+let testProtocol = fn(t: Test) {
+  T.equal(t, protocol("mqtt://broker.example.org/devices/one"), Protocol.Mqtt);
+  T.equal(t, protocol("mqtts://broker.example.org/devices/one"), Protocol.Mqtt);
+  T.equal(t, protocol("http://example.org/whip"), Protocol.Whip);
+  T.equal(t, protocol("https://example.org/whip"), Protocol.Whip);
+  T.isNull(t, protocol("ws://example.org"));
+  T.isNull(t, protocol(""));
+  T.isNull(t, protocol("MQTT://broker.example.org/topic"));
+  null
+};
+
+/* Signalling that fails leaves no session behind, and stopping one forgets
+ * its URL and token: a peer can signal again, elsewhere, as can another. */
+let testSignalsAgain = fn(t: Test) {
+  let (first, second) = freePorts();
+  let peer = new Peer();
+  T.equal(t, thrown(fn() { peer.signal(`https://127.0.0.1:${first}/whip`); null }), cannotConnect);
+  peer.stopSignalling();
+  T.equal(t, thrown(fn() { peer.signal(`https://127.0.0.1:${second}/other`, "token"); null }),
+    cannotConnect);
+  T.equal(t, thrown(fn() { peer.signal(`mqtts://127.0.0.1:${first}/devices/one`); null }),
+    cannotConnect);
+  peer.stopSignalling();
+  let other = new Peer();
+  T.equal(t, thrown(fn() { other.signal(`mqtt://127.0.0.1:${second}/devices/two`, "dTpw"); null }),
+    cannotConnect);
+  peer.close();
+  other.close();
+  null
+};
+
+/* A server that takes the connection but never answers the TLS handshake
+ * makes signal throw once its reads time out, not wait for ever. */
+let testHandshakeGivesUp = fn(t: Test) {
+  // The listener's backlog takes the connection; nothing ever reads it.
+  let silent = Tcp.listen("127.0.0.1", 0);
+  let started = Process.now();
+  T.equal(t, thrown(fn() { new Peer().signal(`https://127.0.0.1:${silent.port()}/whip`); null }),
+    "Peer.signal: the TLS handshake with the server failed");
+  T.isTrue(t, Process.now() - started < 20000);
+  silent.close();
+  null
+};
+
+/* A TLS server whose certificate no trusted authority issued is refused,
+ * though the certificate names the host. The peer signals there after a
+ * signal elsewhere, so it is the second URL that is refused so. */
+let testRefusesUntrustedCertificates = fn(t: Test) {
+  let (found, _, _) = Command.run(["sh", "-c", "command -v openssl"], []);
+  if (found != 0) { T.skip(t, "openssl is not on PATH"); }
+  let dir = "build/test-tls";
+  File.makeDirs(dir);
+  let (made, _, why) = Command.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", `${dir}/key.pem`, "-out", `${dir}/cert.pem`, "-subj", "/CN=localhost",
+    "-days", "1"], []);
+  if (made != 0) { T.fatal(t, `openssl cannot make a certificate: ${why}`); }
+  let (refused, port) = freePorts();
+  let server = Command.start(["openssl", "s_server", "-quiet", "-accept", `${port}`,
+    "-cert", `${dir}/cert.pem`, "-key", `${dir}/key.pem`], []);
+  let peer = new Peer();
+  T.equal(t, thrown(fn() { peer.signal(`https://127.0.0.1:${refused}/whip`); null }),
+    cannotConnect);
+  peer.stopSignalling();
+  // Until the server listens, the connection is refused.
+  let got = cannotConnect;
+  let started = Process.now();
+  while (got == cannotConnect && Process.now() - started < 10000) {
+    got = thrown(fn() { peer.signal(`https://localhost:${port}/whip`); null });
+    if (got == cannotConnect) { Process.sleep(100); }
+  }
+  Command.kill(server);
+  Command.wait(server);
+  T.equal(t, got, "Peer.signal: the server's certificate is not trusted for its host");
+  peer.close();
+  null
+};

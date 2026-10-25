@@ -1,0 +1,12 @@
+// expect: 200
+// gc: collects
+// finalizes: 100
+// Peers that are never closed are freed when they are collected.
+import { Peer } from wobblertc.Peer;
+
+let offers = 0;
+while (offers < 200) {
+  let peer = new Peer();
+  if (peer.createOffer().startsWith("v=0")) { offers++; }
+}
+offers

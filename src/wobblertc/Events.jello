@@ -1,0 +1,45 @@
+package wobblertc;
+
+/* What a peer reports when it is polled: changes of state, its local
+ * description, media and data channel messages from the remote peer. */
+
+/* The states of a peer's connection: New until it has a remote description,
+ * then Checking its candidate pairs, Connected once one answers, and
+ * Completed once DTLS is done and media and messages can flow. Failed when no
+ * pair answers, and Closed when the remote peer stops answering. */
+export enum State { New; Checking; Connected; Completed; Failed; Disconnected; Closed; }
+
+// The name libpeer and WebRTC give a state, such as "checking".
+export let stateName = fn(state: State): Bytes {
+  match (state) {
+    New => "new",
+    Checking => "checking",
+    Connected => "connected",
+    Completed => "completed",
+    Failed => "failed",
+    Disconnected => "disconnected",
+    Closed => "closed",
+  }
+};
+
+/* Something a peer reports:
+ * - StateChange: the peer's connection moved to a new state.
+ * - LocalDescription: the peer's local description, with its candidates,
+ *   once it has gathered them; createOffer and createAnswer return it too.
+ * - Audio and Video: an encoded packet or frame from the remote peer.
+ * - ChannelOpen and ChannelClose: the data channel opened or closed.
+ * - Message: a message on a stream of the data channel.
+ * - KeyframeRequest: the remote peer asked for a key frame (a PLI or FIR).
+ * - Dropped: COUNT events were dropped because the peer was not polled often
+ *   enough to keep up. */
+export enum Event {
+  StateChange(state: State);
+  LocalDescription(sdp: Bytes);
+  Audio(packet: Bytes);
+  Video(frame: Bytes);
+  ChannelOpen;
+  ChannelClose;
+  Message(stream: I32, data: Bytes);
+  KeyframeRequest;
+  Dropped(count: I32);
+}

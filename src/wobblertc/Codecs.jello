@@ -1,0 +1,54 @@
+package wobblertc;
+
+/* The codecs a peer can carry, and a reader for the first byte of an Opus
+ * packet. A peer sends and receives encoded packets as they are: wobblertc
+ * does not encode or decode audio or video. */
+
+// An audio codec: Opus, G.711 A-law (PCMA) or G.711 u-law (PCMU), or none.
+export enum AudioCodec { None; Opus; Pcma; Pcmu; }
+
+// A video codec: H.264, or none.
+export enum VideoCodec { None; H264; }
+
+// How an Opus frame is coded: by SILK, by CELT, or by both at once.
+export enum OpusMode { Silk; Hybrid; Celt; }
+
+/* The table of contents that starts every Opus packet (RFC 6716, section
+ * 3.1): the configuration, 0 to 31, which gives the mode, the bandwidth and
+ * the frame size; whether the packet is stereo; and the frame count code, 0
+ * to 3: one frame, two equal frames, two frames of different sizes, or a
+ * counted number of frames. */
+export typedef OpusToc = {
+  let config: I32;
+  let mode: OpusMode;
+  let stereo: Bool;
+  let frameCode: I32;
+};
+
+typedef _TocByte = bytes-layout {
+  let config: bits(5);
+  let stereo: bits(1);
+  let frames: bits(2);
+  let frameData: rest;
+};
+
+// The mode of an Opus configuration.
+let _mode = fn(config: I32): OpusMode {
+  config < 12 ? OpusMode.Silk : config < 16 ? OpusMode.Hybrid : OpusMode.Celt
+};
+
+// The table of contents of an Opus packet; null for an empty packet.
+export let opusToc = fn(packet: Bytes): ?OpusToc {
+  let toc = _TocByte.unpack(packet);
+  if (toc == null) { return null; }
+  { config: toc.config, mode: _mode(toc.config), stereo: toc.stereo == 1, frameCode: toc.frames }
+};
+
+/* The length of an Opus configuration's frames in microseconds: 10000 to
+ * 60000 for SILK, 10000 or 20000 for hybrid, 2500 to 20000 for CELT. */
+export let opusFrameMicros = fn(config: I32): I32 {
+  let size = config & 3;
+  if (config < 12) { return [10000, 20000, 40000, 60000][size]; }
+  if (config < 16) { return [10000, 20000][size & 1]; }
+  [2500, 5000, 10000, 20000][size]
+};

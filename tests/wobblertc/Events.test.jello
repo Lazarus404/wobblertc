@@ -1,0 +1,15 @@
+package wobblertc;
+
+import type { Test } from std.testing;
+import std.testing as T;
+import { State, stateName } from wobblertc.Events;
+
+let testStateNames = fn(t: Test) {
+  let names = Array.new<Bytes>(0);
+  for (state in [State.New, State.Checking, State.Connected, State.Completed, State.Failed,
+    State.Disconnected, State.Closed]) {
+    names.push(stateName(state));
+  }
+  T.equal(t, names.join(" "), "new checking connected completed failed disconnected closed");
+  null
+};

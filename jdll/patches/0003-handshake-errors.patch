@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jahred Love <jahred.love@aircall.io>
+Date: Sat, 24 Oct 2026 19:54:46 +0100
+Subject: [PATCH] End the signalling TLS handshake on hard errors
+
+What: ssl_transport_connect retried mbedtls_ssl_handshake for as long as
+it failed, whatever the error, so a server that refused the handshake,
+did not speak TLS or said nothing kept it looping for ever. A read that
+timed out was reported to Mbed TLS as the end of the connection. A host
+that did not resolve was connected to as 0.0.0.0, and nothing set up was
+freed when connecting failed.
+
+Now only MBEDTLS_ERR_SSL_WANT_READ and _WANT_WRITE are retried, within
+SSL_TRANSPORT_HANDSHAKE_TIMEOUT; any other error, a read timing out among
+them, ends the handshake. ssl_transport_connect returns 0 or a
+PEER_SIGNALING_ERROR_ code (_CONNECT, or the new _TLS), freeing what it
+set up and closing the socket on every failure, and the signalling
+functions pass the code on.
+
+Why: wobblertc's signal() must return, with a reason, whatever the
+server does.
+
+This patch applies after 0002.
+
+Like libpeer, this patch is under the MIT licence.
+---
+ src/peer_signaling.c |  8 +++++---
+ src/peer_signaling.h |  1 +
+ src/ssl_transport.c  | 44 ++++++++++++++++++++++++++++++++++----------
+ src/ssl_transport.h  |  1 +
+ 4 files changed, 41 insertions(+), 13 deletions(-)
+
+diff --git a/src/peer_signaling.c b/src/peer_signaling.c
+index a443acf..7249411 100644
+--- a/src/peer_signaling.c
++++ b/src/peer_signaling.c
+@@ -344,7 +344,7 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int
+ 
+   if (ret < 0) {
+     LOGE("Failed to connect to %s:%d", hostname, port);
+-    return PEER_SIGNALING_ERROR_CONNECT;
++    return ret;
+   }
+ 
+   res = peer_signaling_http_request(&trans_if, "POST", 4, hostname, strlen(hostname), path,
+@@ -436,9 +436,11 @@ static int peer_signaling_mqtt_connect(const char* hostname, int port) {
+   char username[TOKEN_MAX_LEN] = {0};
+   char password[TOKEN_MAX_LEN] = {0};
+ 
+-  if (ssl_transport_connect(&g_ps.net_ctx, hostname, port, NULL) < 0) {
++  int ret;
++
++  if ((ret = ssl_transport_connect(&g_ps.net_ctx, hostname, port, NULL)) < 0) {
+     LOGE("ssl transport connect failed");
+-    return PEER_SIGNALING_ERROR_CONNECT;
++    return ret;
+   }
+   g_ps.connected = 1;
+ 
+diff --git a/src/peer_signaling.h b/src/peer_signaling.h
+index dfcc792..ca69319 100644
+--- a/src/peer_signaling.h
++++ b/src/peer_signaling.h
+@@ -12,6 +12,7 @@ extern "C" {
+ /* Why signalling failed. */
+ #define PEER_SIGNALING_ERROR_URL -1      /* a URL or token that is malformed or too long */
+ #define PEER_SIGNALING_ERROR_CONNECT -2  /* the server could not be reached */
++#define PEER_SIGNALING_ERROR_TLS -3      /* the TLS handshake failed or took too long */
+ #define PEER_SIGNALING_ERROR_REFUSED -6  /* the server refused, or a WHIP endpoint did not answer */
+ #define PEER_SIGNALING_ERROR_ANSWER -7   /* a WHIP endpoint's answer could not be read */
+ 
+diff --git a/src/ssl_transport.c b/src/ssl_transport.c
+index 9847616..fe60fa6 100644
+--- a/src/ssl_transport.c
++++ b/src/ssl_transport.c
+@@ -10,10 +10,14 @@
+ 
+ #include <sys/select.h>
+ #include "config.h"
++#include "peer_signaling.h"
+ #include "ports.h"
+ #include "ssl_transport.h"
+ #include "utils.h"
+ 
++/* The longest a handshake may take, in milliseconds. */
++#define SSL_TRANSPORT_HANDSHAKE_TIMEOUT (4 * CONFIG_TLS_READ_TIMEOUT)
++
+ static int ssl_transport_mbedtls_recv_timeout(void* ctx, unsigned char* buf, size_t len, uint32_t timeout) {
+   int ret;
+   fd_set read_fds;
+@@ -28,7 +32,8 @@ static int ssl_transport_mbedtls_recv_timeout(void* ctx, unsigned char* buf, siz
+   if (ret < 0) {
+     return -1;
+   } else if (ret == 0) {
+-    // timeout
++    /* Mbed TLS takes 0 for the end of the connection. */
++    return MBEDTLS_ERR_SSL_TIMEOUT;
+   } else {
+     if (FD_ISSET(((TcpSocket*)ctx)->fd, &read_fds)) {
+       ret = tcp_socket_recv((TcpSocket*)ctx, buf, len);
+@@ -48,8 +53,11 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+                           const char* cacert) {
+   const char* pers = "ssl_client";
+   int ret;
++  uint32_t started;
+   Address resolved_addr;
+ 
++  /* Every failure frees what was set up and closes the socket, so that the caller need not. */
++  net_ctx->tcp_socket.fd = -1;
+   mbedtls_ssl_init(&net_ctx->ssl);
+   mbedtls_ssl_config_init(&net_ctx->conf);
+   // mbedtls_x509_crt_init(&net_ctx->cacert);
+@@ -58,7 +66,8 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+ 
+   if ((ret = mbedtls_ctr_drbg_seed(&net_ctx->ctr_drbg, mbedtls_entropy_func, &net_ctx->entropy,
+                                    (const unsigned char*)pers, strlen(pers))) != 0) {
+-    return -1;
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_TLS;
+   }
+ 
+   if ((ret = mbedtls_ssl_config_defaults(&net_ctx->conf,
+@@ -66,7 +75,8 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+                                          MBEDTLS_SSL_TRANSPORT_STREAM,
+                                          MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+     LOGE("ssl config error: -0x%x", (unsigned int)-ret);
+-    return -1;
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_TLS;
+   }
+ 
+   mbedtls_ssl_conf_authmode(&net_ctx->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+@@ -83,20 +93,27 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+ 
+   if ((ret = mbedtls_ssl_setup(&net_ctx->ssl, &net_ctx->conf)) != 0) {
+     LOGE("ssl setup error: -0x%x", (unsigned int)-ret);
+-    return -1;
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_TLS;
+   }
+ 
+   if ((ret = mbedtls_ssl_set_hostname(&net_ctx->ssl, host)) != 0) {
+     LOGE("ssl set hostname error: -0x%x", (unsigned int)-ret);
+-    return -1;
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_TLS;
+   }
+ 
+   memset(&resolved_addr, 0, sizeof(resolved_addr));
+-  tcp_socket_open(&net_ctx->tcp_socket, AF_INET);
+-  ports_resolve_addr(host, &resolved_addr);
++  if (ports_resolve_addr(host, &resolved_addr) != 0) {
++    LOGE("Cannot resolve %s", host);
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_CONNECT;
++  }
+   addr_set_port(&resolved_addr, port);
+-  if ((ret = tcp_socket_connect(&net_ctx->tcp_socket, &resolved_addr) < 0)) {
+-    return -1;
++  if (tcp_socket_open(&net_ctx->tcp_socket, AF_INET) < 0 ||
++      tcp_socket_connect(&net_ctx->tcp_socket, &resolved_addr) < 0) {
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_CONNECT;
+   }
+ 
+   mbedtls_ssl_conf_read_timeout(&net_ctx->conf, CONFIG_TLS_READ_TIMEOUT);
+@@ -105,9 +122,16 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+ 
+   LOGI("start to handshake");
+ 
++  /* Only a handshake that wants to read or write again is retried, and not for ever; any other
++   * error, a server that says nothing for CONFIG_TLS_READ_TIMEOUT milliseconds among them, ends
++   * it. */
++  started = ports_get_epoch_time();
+   while ((ret = mbedtls_ssl_handshake(&net_ctx->ssl)) != 0) {
+-    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++    if ((ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) ||
++        ports_get_epoch_time() - started > SSL_TRANSPORT_HANDSHAKE_TIMEOUT) {
+       LOGE("ssl handshake error: -0x%x", (unsigned int)-ret);
++      ssl_transport_disconnect(net_ctx);
++      return PEER_SIGNALING_ERROR_TLS;
+     }
+   }
+ 
+diff --git a/src/ssl_transport.h b/src/ssl_transport.h
+index fe794dc..5ddbe8d 100644
+--- a/src/ssl_transport.h
++++ b/src/ssl_transport.h
+@@ -20,6 +20,7 @@ struct NetworkContext {
+   mbedtls_x509_crt cacert;
+ };
+ 
++/* Connects to HOST at PORT over TLS; 0, or a PEER_SIGNALING_ERROR_ code with everything freed. */
+ int ssl_transport_connect(NetworkContext_t* net_ctx,
+                           const char* host,
+                           uint16_t port,

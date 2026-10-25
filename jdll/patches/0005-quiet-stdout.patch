@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jahred Love <jahred.love@aircall.io>
+Date: Sat, 24 Oct 2026 19:55:53 +0100
+Subject: [PATCH] Keep libpeer's output off standard output
+
+What: sctp.c printed a line to standard output whenever a data channel
+opened, mdns.c printed when its buffer was too small, and libpeer's own
+log lines went to standard output too.
+
+Now those two go through libpeer's logging, at debug and warning level,
+and its logging writes to standard error, so LOG_LEVEL governs all of it
+and standard output is left to the program. (The printf calls in
+dtls_srtp.c are inside #if 0.)
+
+Why: a Jello program's standard output is its own; wobblertc builds
+libpeer with logging off, and nothing should reach standard output.
+
+This patch applies after 0004.
+
+Like libpeer, this patch is under the MIT licence.
+---
+ src/mdns.c  | 2 +-
+ src/sctp.c  | 2 +-
+ src/utils.h | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/mdns.c b/src/mdns.c
+index 6d7881c..d2c0e59 100644
+--- a/src/mdns.c
++++ b/src/mdns.c
+@@ -97,7 +97,7 @@ static int mdns_build_query(const char* hostname, uint8_t* buf, int size) {
+ 
+   total_size = sizeof(DnsHeader) + strlen(hostname) + sizeof(DnsQuery) + 2;
+   if (size < total_size) {
+-    printf("buf size is not enough");
++    LOGW("buf size is not enough");
+     return -1;
+   }
+ 
+diff --git a/src/sctp.c b/src/sctp.c
+index 644f8d8..3b57199 100644
+--- a/src/sctp.c
++++ b/src/sctp.c
+@@ -189,7 +189,7 @@ void sctp_parse_data_channel_open(Sctp* sctp, uint16_t sid, char* data, size_t l
+     label_str[label_length] = '\0';
+ 
+     // Log or process the DATA_CHANNEL_OPEN message
+-    printf("DATA_CHANNEL_OPEN: Label=%s, sid=%d\n", label_str, sid);
++    LOGD("DATA_CHANNEL_OPEN: Label=%s, sid=%d", label_str, sid);
+ 
+     // Add stream mapping
+     sctp_add_stream_mapping(sctp, label_str, sid);
+diff --git a/src/utils.h b/src/utils.h
+index 72040ae..4519af5 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -26,7 +26,7 @@ void peer_log(char* level_tag, const char* file_name, int line_number, const cha
+   peer_log(level_tag, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+ #else
+ #define LOG_PRINT(level_tag, fmt, ...) \
+-  fprintf(stdout, "%s\t%s\t%d\t" fmt "\n", level_tag, __FILE__, __LINE__, ##__VA_ARGS__)
++  fprintf(stderr, "%s\t%s\t%d\t" fmt "\n", level_tag, __FILE__, __LINE__, ##__VA_ARGS__)
+ #endif
+ 
+ #if LOG_LEVEL >= LEVEL_DEBUG

@@ -1,0 +1,6 @@
+import type { Test } from std.testing;
+import { run } from degust.Programs;
+
+// The examples, and the programs that check what a test cannot, such as traps.
+let testExamples = fn(t: Test) { run(t, "examples"); null };
+let testPrograms = fn(t: Test) { run(t, "tests/programs"); null };

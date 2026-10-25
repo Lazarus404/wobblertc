@@ -1,0 +1,56 @@
+// expect: offerer: checking, connected, completed
+// expect: reply: hello back
+// Two peers in one program, each in a process of its own, connected over this machine's own
+// address: they swap descriptions, connect, and trade a data channel message.
+import std.concurrent.Process as Process;
+import type { Process, Inbox } from std.concurrent.Process;
+import type { Config } from wobblertc.Peer;
+import { Peer, DataChannel, SdpType, defaults } from wobblertc.Peer;
+import { Event, State, stateName } from wobblertc.Events;
+
+let config: Config = { ...defaults(), channel: DataChannel.Text };
+
+// The answering peer: it answers the offer it is sent, then echoes messages until it is stopped.
+let answerer = fn(offer: Bytes, answerTo: Process<Bytes>, inbox: Inbox<Bytes>) {
+  let peer = new Peer(config);
+  peer.setRemoteDescription(offer, SdpType.Offer);
+  answerTo.send(peer.createAnswer());
+  while (inbox.tryReceive() == null) {
+    for (event in peer.poll(20)) {
+      match (event) {
+        Message(stream, data) => { peer.send(data + " back", stream); },
+        _ => {},
+      }
+    }
+  }
+  peer.close();
+};
+
+let offerer = new Peer(config);
+let offer = offerer.createOffer();
+let answers = new Inbox<Bytes>();
+let me = Process.self<Bytes>(answers);
+let answering = Process.spawn<Bytes>(fn(inbox: Inbox<Bytes>) { answerer(offer, me, inbox); });
+offerer.setRemoteDescription(answers.receive(), SdpType.Answer);
+
+let states = Array.new<Bytes>(0);
+let reply = "";
+let opened = false;
+let started = Process.now();
+while (reply == "" && Process.now() - started < 10000) {
+  for (event in offerer.poll(20)) {
+    match (event) {
+      StateChange(state) => { states.push(stateName(state)); },
+      Message(_, data) => { reply = data; },
+      _ => {},
+    }
+  }
+  if (offerer.state() == State.Completed) {
+    if (!opened) { opened = offerer.openChannel("chat"); }
+    offerer.send("hello");
+  }
+}
+answering.send("stop");
+answering.join();
+offerer.close();
+`offerer: ${states.join(", ")}\nreply: ${reply}`

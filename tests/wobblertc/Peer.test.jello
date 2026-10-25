@@ -1,0 +1,404 @@
+package wobblertc;
+
+import type { Test } from std.testing;
+import std.testing as T;
+import std.concurrent.Process as Process;
+import type { Process, Inbox } from std.concurrent.Process;
+import type { Config, IceServer } from wobblertc.Peer;
+import {
+  Peer, DataChannel, SdpType, defaults, maxAudioPacket, _events, _stateOf, _metricsOf, _iceServers
+} from wobblertc.Peer;
+import { AudioCodec, VideoCodec } from wobblertc.Codecs;
+import { Event, State } from wobblertc.Events;
+import { version } from wobblertc.Meta;
+
+// A peer of the defaults with these codecs and data channel.
+let peerWith = fn(audio: AudioCodec, video: VideoCodec, channel: DataChannel): Peer {
+  new Peer({ ...defaults(), audio: audio, video: video, channel: channel })
+};
+
+// Packed event records, as the native poll gives them: kind, number, then the bytes.
+let record = fn(kind: I32, number: I32, data: Bytes): Bytes {
+  let buffer = Bytes.new(12 + data.len());
+  let at = Bytes.writeI32Le(buffer, 0, kind);
+  at = Bytes.writeI32Le(buffer, at, number);
+  at = Bytes.writeI32Le(buffer, at, data.len());
+  let i = 0;
+  while (i < data.len()) { buffer.set(at + i, data.get(i)); i++; }
+  buffer.toString()
+};
+
+// TEXT, COUNT times over.
+let times = fn(text: Bytes, count: I32): Bytes {
+  let parts = Array.new<Bytes>(0);
+  while (parts.len() < count) { parts.push(text); }
+  parts.join("")
+};
+
+let server = fn(url: Bytes): IceServer { { url: url, username: "", credential: "" } };
+
+// What BODY throws, or "" when it does not.
+let thrown = fn(body: () -> Null): Bytes {
+  try { body(); "" } catch (e) { e as Bytes }
+};
+
+// COUNT candidate lines, with foundations from FIRST, each ending in "\r\n".
+let candidates = fn(first: I32, count: I32): Bytes {
+  let lines = "";
+  let i = first;
+  while (i < first + count) {
+    lines = lines + `a=candidate:${i} 1 UDP 1 192.168.1.1 ${9000 + i} typ host\r\n`;
+    i++;
+  }
+  lines
+};
+
+let host = "a=candidate:1 1 UDP 2122260223 192.168.1.1 54400 typ host";
+
+let testVersion = fn(t: Test) {
+  T.equal(t, version(), "0.1.0");
+  null
+};
+
+let testDecodesEvents = fn(t: Test) {
+  let raw = record(0, 4, "") + record(1, 0, "v=0") + record(2, 0, "\xf8\x01")
+    + record(3, 0, "\x00\x00\x00\x01") + record(4, 0, "") + record(5, 0, "")
+    + record(6, 3, "ping") + record(7, 0, "") + record(8, 12, "");
+  T.equal(t, Std.string(_events(raw)), Std.string([
+    Event.StateChange(State.Completed), Event.LocalDescription("v=0"), Event.Audio("\xf8\x01"),
+    Event.Video("\x00\x00\x00\x01"), Event.ChannelOpen, Event.ChannelClose,
+    Event.Message(3, "ping"), Event.KeyframeRequest, Event.Dropped(12)
+  ]));
+  T.equal(t, _events("").len(), 0);
+  null
+};
+
+let testDecodesBinaryMessages = fn(t: Test) {
+  let events = _events(record(6, 1, "a\x00b") + record(6, 2, ""));
+  T.equal(t, events.len(), 2);
+  T.equal(t, events[0], Event.Message(1, "a\x00b"));
+  T.equal(t, events[1], Event.Message(2, ""));
+  null
+};
+
+let testStateNumbers = fn(t: Test) {
+  let states = [State.Closed, State.New, State.Checking, State.Connected, State.Completed,
+    State.Failed, State.Disconnected];
+  let i = 0;
+  while (i < states.len()) { T.equal(t, _stateOf(i), states[i]); i++; }
+  null
+};
+
+let testDecodesMetrics = fn(t: Test) {
+  let buffer = Bytes.new(80);
+  let i = 0;
+  while (i < 10) { Bytes.writeI64Le(buffer, i * 8, (i + 1) as I64 * 1000000000000i64); i++; }
+  let m = _metricsOf(buffer.toString());
+  T.equal(t, m.audioBytesSent, 1000000000000i64);
+  T.equal(t, m.audioPacketsReceived, 4000000000000i64);
+  T.equal(t, m.videoFramesReceived, 8000000000000i64);
+  T.equal(t, m.messagesReceived, 10000000000000i64);
+  null
+};
+
+let testPacksIceServers = fn(t: Test) {
+  T.equal(t, _iceServers([]), "");
+  let turn: IceServer = { url: "turn:turn.example.org:3478", username: "me", credential: "pw" };
+  T.equal(t, _iceServers([server("stun:stun.example.org:19302"), turn]),
+    "stun:stun.example.org:19302\x00\x00\x00turn:turn.example.org:3478\x00me\x00pw\x00");
+  null
+};
+
+let testRefusesBadIceServers = fn(t: Test) {
+  let bad = fn(servers: Array<IceServer>) {
+    let config: Config = { ...defaults(), iceServers: servers };
+    T.throws(t, fn() { new Peer(config); null });
+    null
+  };
+  bad([server("http://stun.example.org:3478")]);
+  bad([server("stun:")]);
+  bad([server("stun:stun.example.org")]);
+  bad([server("stun:stun.example.org:3478\x00")]);
+  let six = Array.new<IceServer>(0);
+  while (six.len() < 6) { six.push(server("stun:stun.example.org:3478")); }
+  bad(six);
+  null
+};
+
+let testNewPeer = fn(t: Test) {
+  let peer = new Peer();
+  T.equal(t, peer.state(), State.New);
+  T.equal(t, peer.poll().len(), 0);
+  let m = peer.metrics();
+  T.equal(t, m.audioBytesSent, 0i64);
+  T.equal(t, m.messagesReceived, 0i64);
+  peer.close();
+  peer.close();
+  null
+};
+
+let testOfferNamesCodecs = fn(t: Test) {
+  let offer = new Peer().createOffer();
+  T.isTrue(t, offer.startsWith("v=0\r\n"));
+  T.isTrue(t, offer.contains("m=audio"));
+  T.isTrue(t, offer.contains("opus/48000/2"));
+  T.isTrue(t, !offer.contains("m=video"));
+  T.isTrue(t, !offer.contains("webrtc-datachannel"));
+  T.isTrue(t, peerWith(AudioCodec.Pcma, VideoCodec.None, DataChannel.None).createOffer()
+    .contains("PCMA/8000"));
+  T.isTrue(t, peerWith(AudioCodec.Pcmu, VideoCodec.None, DataChannel.None).createOffer()
+    .contains("PCMU/8000"));
+  let video = peerWith(AudioCodec.None, VideoCodec.H264, DataChannel.Binary).createOffer();
+  T.isTrue(t, video.contains("m=video"));
+  T.isTrue(t, video.contains("H264/90000"));
+  T.isTrue(t, video.contains("webrtc-datachannel"));
+  T.isTrue(t, !video.contains("m=audio"));
+  null
+};
+
+let testOfferIsQueued = fn(t: Test) {
+  let peer = new Peer();
+  let offer = peer.createOffer();
+  let events = peer.poll();
+  T.equal(t, events.len(), 1);
+  T.equal(t, events[0], Event.LocalDescription(offer));
+  T.equal(t, peer.poll().len(), 0);
+  null
+};
+
+let testAnswerStartsChecks = fn(t: Test) {
+  let offerer = new Peer();
+  let answerer = new Peer();
+  answerer.setRemoteDescription(offerer.createOffer(), SdpType.Offer);
+  T.equal(t, answerer.state(), State.New);
+  let answer = answerer.createAnswer();
+  T.isTrue(t, answer.contains("a=setup:active"));
+  T.equal(t, answerer.state(), State.Checking);
+  offerer.setRemoteDescription(answer, SdpType.Answer);
+  T.equal(t, offerer.state(), State.Checking);
+  let events = offerer.poll();
+  T.isTrue(t, events.len() >= 2);
+  T.equal(t, events[1], Event.StateChange(State.Checking));
+  null
+};
+
+let testTakesLineFeeds = fn(t: Test) {
+  let offerer = new Peer();
+  let answerer = new Peer();
+  answerer.setRemoteDescription(offerer.createOffer().replaceAll("\r\n", "\n"), SdpType.Offer);
+  offerer.setRemoteDescription(answerer.createAnswer().replaceAll("\r\n", "\n"), SdpType.Answer);
+  T.equal(t, offerer.state(), State.Checking);
+  null
+};
+
+let testRefusesBadDescriptions = fn(t: Test) {
+  let peer = new Peer();
+  let refuses = fn(sdp: Bytes, why: Bytes) {
+    T.equal(t, thrown(fn() { peer.setRemoteDescription(sdp, SdpType.Answer); null }),
+      `Peer.setRemoteDescription: ${why}`);
+    null
+  };
+  let malformed = "a candidate or fingerprint is malformed";
+  let tooLong = "a field is longer than libpeer keeps";
+  refuses("", "the description is empty");
+  refuses("v=0\r\na=x\x00y\r\n", "the description holds a zero byte");
+  refuses("v=0\r\na=candidate:1 1 UDP\r\n", malformed);
+  // A candidate's fields stop at the end of its line, not on the next.
+  refuses("v=0\r\na=candidate:1 1 UDP 1\r\na=x 192.168.1.1 9 typ host\r\n", malformed);
+  refuses("v=0\r\na=candidate:1 1 UDP one 192.168.1.1 9 typ host\r\n", malformed);
+  refuses(`v=0\r\na=candidate:${times("f", 40)} 1 UDP 1 192.168.1.1 9 typ host\r\n`, tooLong);
+  refuses("v=0\r\na=candidate:1 1 UDP 1 192.168.1.1 9 typ hostwithaverylongtype\r\n", tooLong);
+  refuses(`v=0\r\na=ice-ufrag:${times("u", 257)}\r\n`, tooLong);
+  refuses(`v=0\r\na=ice-pwd:${times("p", 257)}\r\n`, tooLong);
+  refuses(`v=0\r\na=fingerprint:sha-256 ${times("AB:", 60)}\r\n`, tooLong);
+  refuses("v=0\r\na=fingerprint\r\n", malformed);
+  refuses(`v=0\r\n${candidates(0, 33)}`,
+    "the peer already has as many remote candidates as libpeer keeps, 32");
+  // None of them changed the peer.
+  T.equal(t, peer.state(), State.New);
+  null
+};
+
+let testTakesLongLines = fn(t: Test) {
+  let offerer = new Peer();
+  let answerer = new Peer();
+  let long = `a=fmtp:111 ${times("x", 2000)}\r\n`;
+  answerer.setRemoteDescription(offerer.createOffer() + long, SdpType.Offer);
+  let answer = answerer.createAnswer();
+  offerer.setRemoteDescription(answer.replaceAll("a=ice-ufrag", `${long}a=ice-ufrag`), SdpType.Answer);
+  T.equal(t, offerer.state(), State.Checking);
+  null
+};
+
+let testPassesOverCandidatesItCannotUse = fn(t: Test) {
+  let peer = new Peer();
+  peer.setRemoteDescription(
+    "v=0\r\na=candidate:1 1 TCP 1 192.168.1.1 9 typ host tcptype passive\r\n"
+      + "a=candidate:2 1 UDP 1 192.168.1.1 9 typ prflx\r\n", SdpType.Offer);
+  T.equal(t, peer.state(), State.New);
+  null
+};
+
+let testAddsCandidates = fn(t: Test) {
+  let peer = new Peer();
+  peer.createOffer();
+  peer.addIceCandidate(host).addIceCandidate("candidate:2 1 udp 1 10.0.0.1 9 typ srflx");
+  peer.addIceCandidate("").addIceCandidate("\r\n");
+  let refuses = fn(candidate: Bytes, why: Bytes) {
+    T.equal(t, thrown(fn() { peer.addIceCandidate(candidate); null }),
+      `Peer.addIceCandidate: ${why}`);
+    null
+  };
+  refuses("candidate:3 1 udp", "a candidate or fingerprint is malformed");
+  refuses("a=foo:1", "a candidate or fingerprint is malformed");
+  refuses("candidate:3 1 udp 1 10.0.0.1 99999 typ host", "a candidate or fingerprint is malformed");
+  refuses("candidate:3 1 tcp 1 10.0.0.1 9 typ host",
+    "libpeer cannot use the candidate: only UDP host, srflx and relay ones");
+  refuses(`candidate:3 1 udp 1 ${times("9", 60)} 9 typ host`, "a field is longer than libpeer keeps");
+  // A long line is read where it lies; what follows the type is passed over.
+  peer.addIceCandidate(`candidate:5 1 udp 1 10.0.0.1 9 typ host ${times("x", 1000)}`);
+  refuses("candidate:4 1 udp 1 10.0.0.1 9 typ host\x00", "the candidate holds a zero byte");
+  null
+};
+
+let testKeepsThirtyTwoCandidates = fn(t: Test) {
+  let full = "Peer.addIceCandidate: the peer already has as many remote candidates as libpeer keeps, 32";
+  let peer = new Peer();
+  peer.createOffer();
+  // More than 10, in a description and one by one.
+  peer.setRemoteDescription(`v=0\r\n${candidates(0, 20)}`, SdpType.Offer);
+  let i = 20;
+  while (i < 32) {
+    peer.addIceCandidate(`candidate:${i} 1 udp 1 192.168.1.1 ${9000 + i} typ host`);
+    i++;
+  }
+  T.equal(t, thrown(fn() { peer.addIceCandidate(host); null }), full);
+  T.equal(t, thrown(fn() {
+    peer.setRemoteDescription(`v=0\r\n${candidates(40, 1)}`, SdpType.Offer); null
+  }), "Peer.setRemoteDescription: the peer already has as many remote candidates as libpeer keeps, 32");
+  // A candidate it has already is not counted again.
+  peer.setRemoteDescription(`v=0\r\n${candidates(0, 1)}`, SdpType.Offer);
+  // A new offer starts again.
+  peer.createOffer();
+  peer.addIceCandidate(host);
+  null
+};
+
+let testSendsNothingBeforeConnecting = fn(t: Test) {
+  let peer = peerWith(AudioCodec.Pcma, VideoCodec.H264, DataChannel.Text);
+  T.equal(t, peer.sendAudio(times("\xd5", 160)), false);
+  T.equal(t, peer.sendVideo("\x00\x00\x00\x01\x65"), false);
+  T.equal(t, peer.send("ping"), false);
+  T.equal(t, peer.openChannel("chat"), false);
+  T.equal(t, peer.metrics().audioPacketsSent, 0i64);
+  null
+};
+
+let testRefusesWhatThePeerCannotCarry = fn(t: Test) {
+  let silent = peerWith(AudioCodec.None, VideoCodec.None, DataChannel.None);
+  T.throws(t, fn() { silent.sendAudio("x"); null });
+  T.throws(t, fn() { silent.sendVideo("x"); null });
+  T.throws(t, fn() { silent.send("x"); null });
+  T.throws(t, fn() { silent.openChannel("x"); null });
+  let opus = new Peer();
+  T.throws(t, fn() { opus.sendAudio(times("x", maxAudioPacket + 1)); null });
+  null
+};
+
+let testRefusesBadSignallingUrls = fn(t: Test) {
+  let peer = new Peer();
+  let refuses = fn(url: Bytes, token: Bytes) {
+    T.throws(t, fn() { peer.signal(url, token); null });
+    null
+  };
+  refuses("ws://broker.example.org/topic", "");
+  refuses("", "");
+  refuses("mqtts://broker.example.org", "");
+  refuses("mqtts://broker.example.org/", "");
+  refuses("https:///whip", "");
+  refuses(`https://${times("h", 64)}/whip`, "");
+  refuses(`https://example.org/${times("p", 127)}`, "");
+  refuses("https://example.org/whip", times("t", 256));
+  refuses("https://example.org/whip", "a\x00b");
+  refuses("https://example.org:0/whip", "");
+  refuses("https://example.org:443x/whip", "");
+  refuses(`mqtts://broker.example.org/devices/${times("c", 32)}`, "");
+  peer.stopSignalling();
+  null
+};
+
+/* The messages between the two peers of the loopback test, and from them back
+ * to the test. */
+enum Note { Description(sdp: Bytes); Seen(what: Bytes); Stop; }
+
+/* Two peers in one program, each in its own process, connected over this
+ * machine's own address: they swap descriptions, connect, then trade audio
+ * and data channel messages. */
+let testLoopback = fn(t: Test) {
+  let config: Config = { ...defaults(), channel: DataChannel.Text };
+  let offerer = new Peer(config);
+  let offer = offerer.createOffer();
+  if (!offer.contains(" typ host")) { T.skip(t, "this machine has no address to connect over"); }
+  let notes = new Inbox<Note>();
+  let test = Process.self<Note>(notes);
+  let answering = Process.spawn<Note>(fn(inbox: Inbox<Note>) {
+    let answerer = new Peer(config);
+    let stopped = false;
+    match (inbox.receive()) {
+      Description(sdp) => {
+        answerer.setRemoteDescription(sdp, SdpType.Offer);
+        test.send(Note.Description(answerer.createAnswer()));
+      },
+      _ => { stopped = true; },
+    }
+    while (!stopped) {
+      for (event in answerer.poll(20)) {
+        match (event) {
+          Audio(packet) => { test.send(Note.Seen(`audio ${packet.toHex()}`)); },
+          Message(stream, data) => { answerer.send(`${data} back`, stream); },
+          _ => {},
+        }
+      }
+      stopped = inbox.tryReceive() != null;
+    }
+    answerer.close();
+  });
+  answering.send(Note.Description(offer));
+  match (notes.receive()) {
+    Description(sdp) => { offerer.setRemoteDescription(sdp, SdpType.Answer); },
+    _ => {},
+  }
+  let states = Array.new<State>(0);
+  let reply = "";
+  let audio = "";
+  let asked = false;
+  let started = Process.now();
+  while ((reply == "" || audio == "") && Process.now() - started < 10000) {
+    for (event in offerer.poll(20)) {
+      match (event) {
+        StateChange(state) => { states.push(state); },
+        Message(_, data) => { reply = data; },
+        _ => {},
+      }
+    }
+    if (offerer.state() == State.Completed) {
+      if (!asked) { asked = offerer.openChannel("chat"); }
+      offerer.send("ping");
+      offerer.sendAudio("\xf8\xff\xfe");
+    }
+    let seen = notes.tryReceive();
+    if (seen != null) {
+      match (seen) { Seen(what) => { audio = what; }, _ => {} }
+    }
+  }
+  answering.send(Note.Stop);
+  answering.join();
+  T.equal(t, Std.string(states), Std.string([State.Checking, State.Connected, State.Completed]));
+  T.equal(t, reply, "ping back");
+  T.equal(t, audio, "audio f8fffe");
+  let m = offerer.metrics();
+  T.isTrue(t, m.messagesSent >= 1i64 && m.messagesReceived >= 1i64);
+  T.isTrue(t, m.audioPacketsSent >= 1i64 && m.audioBytesSent == m.audioPacketsSent * 3i64);
+  offerer.close();
+  null
+};

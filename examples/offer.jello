@@ -1,0 +1,21 @@
+// expect: m=video 9 UDP/TLS/RTP/SAVPF 96
+// expect: a=rtpmap:96 H264/90000
+// expect: m=audio 9 UDP/TLS/RTP/SAVP 0
+// expect: a=rtpmap:0 PCMU/8000
+// expect: m=application 50712 UDP/DTLS/SCTP webrtc-datachannel
+// expect: state: new
+// The media an offer describes, for a peer with PCMU audio, H.264 video and a data channel.
+import { Peer, DataChannel, defaults } from wobblertc.Peer;
+import { AudioCodec, VideoCodec } from wobblertc.Codecs;
+import { stateName } from wobblertc.Events;
+
+let peer = new Peer({
+  ...defaults(), audio: AudioCodec.Pcmu, video: VideoCodec.H264, channel: DataChannel.Text
+});
+let media = Array.new<Bytes>(0);
+for (line in peer.createOffer().split("\r\n")) {
+  if (line.startsWith("m=") || line.startsWith("a=rtpmap:")) { media.push(line); }
+}
+media.push(`state: ${stateName(peer.state())}`);
+peer.close();
+media.join("\n")

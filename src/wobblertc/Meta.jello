@@ -1,0 +1,4 @@
+package wobblertc;
+
+// The version of the wobblertc package.
+export let version = fn(): Bytes { "0.1.0" };

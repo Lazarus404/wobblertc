@@ -1,0 +1,13 @@
+// trap: UNSENDABLE concurrent/Process.jello
+// called: 12:1
+// A peer stays in the process that made it; closing it twice is harmless.
+import std.concurrent.Process as Process;
+import type { Inbox } from std.concurrent.Process;
+import { Peer } from wobblertc.Peer;
+
+let peer = new Peer();
+peer.close();
+peer.close();
+let child = Process.spawn<Peer>(fn(inbox: Inbox<Peer>) { inbox.receive(); null; });
+child.send(peer);
+null

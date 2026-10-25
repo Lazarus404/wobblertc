@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jahred Love <jahred.love@aircall.io>
+Date: Sat, 24 Oct 2026 19:55:32 +0100
+Subject: [PATCH] Verify the signalling server's certificate
+
+What: ssl_transport_connect set MBEDTLS_SSL_VERIFY_OPTIONAL and gave Mbed
+TLS no certificates to trust, so WHIP and MQTT signalling accepted any
+server, and could not tell the real one from someone in the middle.
+
+Now the server's certificate must be issued, for the host of the URL, by
+an authority the system trusts: the certificates of SSL_CERT_FILE and of
+the directories in SSL_CERT_DIR, as OpenSSL finds them, or when neither
+is set the first of the usual bundles that holds any (/etc/ssl/cert.pem
+on macOS, Alpine and the BSDs, then the Debian, Fedora and openSUSE
+paths), or the PEM the caller passes as cacert. Verification is required,
+and with no certificates to check against nothing is connected to: it
+fails closed. The new PEER_SIGNALING_ERROR_CERTIFICATE and _NO_CA say
+which. Mbed TLS matches the host against the certificate's names, not
+its IP addresses.
+
+Why: wobblertc's signalling carries descriptions that decide whom a peer
+connects to, and must only be swapped with the server the URL names.
+
+This patch applies after 0003.
+
+Like libpeer, this patch is under the MIT licence.
+---
+ src/peer_signaling.h |  2 ++
+ src/ssl_transport.c  | 73 ++++++++++++++++++++++++++++++++++++++------
+ src/ssl_transport.h  |  4 ++-
+ 3 files changed, 68 insertions(+), 11 deletions(-)
+
+diff --git a/src/peer_signaling.h b/src/peer_signaling.h
+index ca69319..d75dedd 100644
+--- a/src/peer_signaling.h
++++ b/src/peer_signaling.h
+@@ -13,6 +13,8 @@ extern "C" {
+ #define PEER_SIGNALING_ERROR_URL -1      /* a URL or token that is malformed or too long */
+ #define PEER_SIGNALING_ERROR_CONNECT -2  /* the server could not be reached */
+ #define PEER_SIGNALING_ERROR_TLS -3      /* the TLS handshake failed or took too long */
++#define PEER_SIGNALING_ERROR_CERTIFICATE -4 /* the server's certificate is not trusted for its host */
++#define PEER_SIGNALING_ERROR_NO_CA -5    /* no trusted certificates to check the server's against */
+ #define PEER_SIGNALING_ERROR_REFUSED -6  /* the server refused, or a WHIP endpoint did not answer */
+ #define PEER_SIGNALING_ERROR_ANSWER -7   /* a WHIP endpoint's answer could not be read */
+ 
+diff --git a/src/ssl_transport.c b/src/ssl_transport.c
+index fe60fa6..8fd2834 100644
+--- a/src/ssl_transport.c
++++ b/src/ssl_transport.c
+@@ -9,12 +9,58 @@
+ #include "mbedtls/ssl.h"
+ 
+ #include <sys/select.h>
++#include <sys/stat.h>
+ #include "config.h"
+ #include "peer_signaling.h"
+ #include "ports.h"
+ #include "ssl_transport.h"
+ #include "utils.h"
+ 
++/* Where systems keep the certificates they trust, for when neither SSL_CERT_FILE nor
++ * SSL_CERT_DIR is set: the first of these that holds any is used. */
++static const char* const ssl_transport_system_certificates[] = {
++    "/etc/ssl/cert.pem",                   /* macOS, Alpine, the BSDs */
++    "/etc/ssl/certs/ca-certificates.crt",  /* Debian, Ubuntu */
++    "/etc/pki/tls/certs/ca-bundle.crt",    /* Fedora, RHEL */
++    "/etc/ssl/ca-bundle.pem",              /* openSUSE */
++};
++
++/* Reads the certificates the system trusts into CERTS, as OpenSSL finds them: those of the file
++ * SSL_CERT_FILE and of the directories in SSL_CERT_DIR, separated by colons, or when neither is
++ * set the first of the usual bundles that holds any. Certificates Mbed TLS cannot read are passed
++ * over. 0 when it read any. */
++static int ssl_transport_system_ca(mbedtls_x509_crt* certs) {
++  const char* file = getenv("SSL_CERT_FILE");
++  const char* dirs = getenv("SSL_CERT_DIR");
++  struct stat st;
++  if (file && !*file) file = NULL;
++  if (dirs && !*dirs) dirs = NULL;
++  if (file || dirs) {
++    if (file) {
++      mbedtls_x509_crt_parse_file(certs, file);
++    }
++    for (const char* dir = dirs; dir && *dir;) {
++      const char* end = strchr(dir, ':');
++      size_t len = end ? (size_t)(end - dir) : strlen(dir);
++      char path[4096];
++      if (len > 0 && len < sizeof(path)) {
++        memcpy(path, dir, len);
++        path[len] = '\0';
++        mbedtls_x509_crt_parse_path(certs, path);
++      }
++      dir = end ? end + 1 : dir + len;
++    }
++  } else {
++    size_t n = sizeof(ssl_transport_system_certificates) / sizeof(ssl_transport_system_certificates[0]);
++    for (size_t i = 0; i < n && !certs->version; i++) {
++      if (stat(ssl_transport_system_certificates[i], &st) == 0) {
++        mbedtls_x509_crt_parse_file(certs, ssl_transport_system_certificates[i]);
++      }
++    }
++  }
++  return certs->version ? 0 : -1;
++}
++
+ /* The longest a handshake may take, in milliseconds. */
+ #define SSL_TRANSPORT_HANDSHAKE_TIMEOUT (4 * CONFIG_TLS_READ_TIMEOUT)
+ 
+@@ -60,7 +106,7 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+   net_ctx->tcp_socket.fd = -1;
+   mbedtls_ssl_init(&net_ctx->ssl);
+   mbedtls_ssl_config_init(&net_ctx->conf);
+-  // mbedtls_x509_crt_init(&net_ctx->cacert);
++  mbedtls_x509_crt_init(&net_ctx->cacert);
+   mbedtls_ctr_drbg_init(&net_ctx->ctr_drbg);
+   mbedtls_entropy_init(&net_ctx->entropy);
+ 
+@@ -79,15 +125,21 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+     return PEER_SIGNALING_ERROR_TLS;
+   }
+ 
+-  mbedtls_ssl_conf_authmode(&net_ctx->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+-  /*
+-  XXX: not sure if this is needed
+-  ret = mbedtls_x509_crt_parse(&net_ctx->cacert, (const unsigned char *) cacert, strlen(cacert) + 1);
+-  if (ret < 0) {
+-    LOGE("ssl parse error: -0x%x", (unsigned int) -ret);
++  /* The server must prove who it is with a certificate that a trusted authority issued for the
++   * host: those of CACERT, a PEM string, or else those the system trusts. With none to check
++   * against, nothing is connected to. */
++  if (cacert) {
++    ret = mbedtls_x509_crt_parse(&net_ctx->cacert, (const unsigned char*)cacert, strlen(cacert) + 1);
++  } else {
++    ret = ssl_transport_system_ca(&net_ctx->cacert);
++  }
++  if (ret < 0 || !net_ctx->cacert.version) {
++    LOGE("no trusted certificates");
++    ssl_transport_disconnect(net_ctx);
++    return PEER_SIGNALING_ERROR_NO_CA;
+   }
++  mbedtls_ssl_conf_authmode(&net_ctx->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+   mbedtls_ssl_conf_ca_chain(&net_ctx->conf, &net_ctx->cacert, NULL);
+-  */
+ 
+   mbedtls_ssl_conf_rng(&net_ctx->conf, mbedtls_ctr_drbg_random, &net_ctx->ctr_drbg);
+ 
+@@ -130,8 +182,9 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+     if ((ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) ||
+         ports_get_epoch_time() - started > SSL_TRANSPORT_HANDSHAKE_TIMEOUT) {
+       LOGE("ssl handshake error: -0x%x", (unsigned int)-ret);
++      int untrusted = ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+       ssl_transport_disconnect(net_ctx);
+-      return PEER_SIGNALING_ERROR_TLS;
++      return untrusted ? PEER_SIGNALING_ERROR_CERTIFICATE : PEER_SIGNALING_ERROR_TLS;
+     }
+   }
+ 
+@@ -141,7 +194,7 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
+ 
+ void ssl_transport_disconnect(NetworkContext_t* net_ctx) {
+   mbedtls_ssl_config_free(&net_ctx->conf);
+-  // mbedtls_x509_crt_free(&net_ctx->cacert);
++  mbedtls_x509_crt_free(&net_ctx->cacert);
+   mbedtls_ctr_drbg_free(&net_ctx->ctr_drbg);
+   mbedtls_entropy_free(&net_ctx->entropy);
+   mbedtls_ssl_free(&net_ctx->ssl);
+diff --git a/src/ssl_transport.h b/src/ssl_transport.h
+index 5ddbe8d..ebf4670 100644
+--- a/src/ssl_transport.h
++++ b/src/ssl_transport.h
+@@ -20,7 +20,9 @@ struct NetworkContext {
+   mbedtls_x509_crt cacert;
+ };
+ 
+-/* Connects to HOST at PORT over TLS; 0, or a PEER_SIGNALING_ERROR_ code with everything freed. */
++/* Connects to HOST at PORT over TLS, verifying the server's certificate against CACERT, PEM text,
++ * or when it is NULL the certificates the system trusts; 0, or a PEER_SIGNALING_ERROR_ code with
++ * everything freed. */
+ int ssl_transport_connect(NetworkContext_t* net_ctx,
+                           const char* host,
+                           uint16_t port,

@@ -1,0 +1,9 @@
+// trap: TYPE_MISMATCH 9:1
+// A peer is not used after it is closed.
+load { peer_new, peer_close, peer_state } from wobblertc;
+typedef Peer = abstract;
+let open: (I32, I32, I32, Bytes) -> Peer = peer_new;
+let close: (Peer) -> Void = peer_close;
+let state: (Peer) -> I32 = peer_state;
+let p = open(1, 0, 0, ""); close(p);
+state(p)

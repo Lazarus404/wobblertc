@@ -1,0 +1,289 @@
+package wobblertc;
+
+/* WebRTC peers, on libpeer. A peer offers or answers a session description,
+ * takes the remote peer's description and candidates, connects over UDP with
+ * ICE, secures the connection with DTLS-SRTP, and then carries encoded audio
+ * and video and, over SCTP, data channel messages.
+ *
+ * libpeer works when it is polled: poll runs it, and gives back the events it
+ * has to report. A peer stays in the process that made it. */
+
+import { AudioCodec, VideoCodec } from wobblertc.Codecs;
+import { Event, State } from wobblertc.Events;
+import type { Metrics } from wobblertc.Metrics;
+import { protocol } from wobblertc.Signaling;
+
+load {
+  peer_new, peer_close, peer_state, peer_offer, peer_answer, peer_set_remote, peer_add_candidate,
+  peer_send_audio, peer_send_video, peer_send, peer_open_channel, peer_poll, peer_metrics,
+  peer_signal, peer_unsignal
+} from wobblertc;
+
+// A libpeer peer connection, with the events it has queued.
+typedef Handle = abstract;
+
+// A new peer: the tags of its audio codec, video codec and data channel, and its ICE servers.
+let _new: (I32, I32, I32, Bytes) -> Handle = peer_new;
+let _close: (Handle) -> Void = peer_close;
+// The state, as libpeer numbers it.
+let _state: (Handle) -> I32 = peer_state;
+let _offer: (Handle) -> Bytes = peer_offer;
+let _answer: (Handle) -> Bytes = peer_answer;
+// Sets the remote description, an answer when the third argument is 1; what is wrong, or "".
+let _setRemote: (Handle, Bytes, I32) -> Bytes = peer_set_remote;
+// Adds a remote candidate; what is wrong with it, or "".
+let _addCandidate: (Handle, Bytes) -> Bytes = peer_add_candidate;
+let _sendAudio: (Handle, Bytes) -> Bool = peer_send_audio;
+let _sendVideo: (Handle, Bytes) -> Bool = peer_send_video;
+let _send: (Handle, Bytes, I32) -> Bool = peer_send;
+let _openChannel: (Handle, Bytes, I32) -> Bool = peer_open_channel;
+// Runs libpeer for up to the milliseconds given, until there are events; the events, packed.
+let _poll: (Handle, I32) -> Bytes = peer_poll;
+// The metrics, as ten little-endian I64s.
+let _metrics: (Handle) -> Bytes = peer_metrics;
+// Signals for the peer at a URL with a token; what went wrong, or "".
+let _signal: (Handle, Bytes, Bytes) -> Bytes = peer_signal;
+let _unsignal: (Handle) -> Void = peer_unsignal;
+
+// The longest audio packet a peer sends: one RTP packet.
+export const maxAudioPacket = 1200;
+
+// The most ICE servers a peer takes.
+export const maxIceServers = 5;
+
+// Whether a peer has a data channel, and whether its messages are text or binary.
+export enum DataChannel { None; Text; Binary; }
+
+// Which side's description a remote description is.
+export enum SdpType { Offer; Answer; }
+
+/* A STUN or TURN server: a URL such as "stun:stun.example.org:3478", and for
+ * TURN, a username and credential, empty for STUN. */
+export typedef IceServer = { let url: Bytes; let username: Bytes; let credential: Bytes; };
+
+/* What a peer carries: its audio and video codecs, whether it has a data
+ * channel, and the ICE servers it gathers candidates from beside its own
+ * host addresses. */
+export typedef Config = {
+  let audio: AudioCodec;
+  let video: VideoCodec;
+  let channel: DataChannel;
+  let iceServers: Array<IceServer>;
+};
+
+// A peer's configuration by default: Opus audio, no video, no data channel and no ICE servers.
+export let defaults = fn(): Config {
+  { audio: AudioCodec.Opus, video: VideoCodec.None, channel: DataChannel.None, iceServers: [] }
+};
+
+// A state from libpeer's number for it.
+let _stateOf = fn(number: I32): State {
+  match (number) {
+    1 => State.New,
+    2 => State.Checking,
+    3 => State.Connected,
+    4 => State.Completed,
+    5 => State.Failed,
+    6 => State.Disconnected,
+    _ => State.Closed,
+  }
+};
+
+// The events of the records poll packs: an I32 kind, number and length each, then the bytes.
+let _events = fn(raw: Bytes): Array<Event> {
+  let events = Array.new<Event>(0);
+  let at = 0;
+  while (at + 12 <= raw.len()) {
+    let number = raw.readI32Le(at + 4);
+    let length = raw.readI32Le(at + 8);
+    let data = Bytes.slice(raw, at + 12, length);
+    let event = match (raw.readI32Le(at)) {
+      0 => Event.StateChange(_stateOf(number)),
+      1 => Event.LocalDescription(data),
+      2 => Event.Audio(data),
+      3 => Event.Video(data),
+      4 => Event.ChannelOpen,
+      5 => Event.ChannelClose,
+      6 => Event.Message(number, data),
+      7 => Event.KeyframeRequest,
+      _ => Event.Dropped(number),
+    };
+    events.push(event);
+    at += 12 + length;
+  }
+  events
+};
+
+// The metrics of the ten I64s metrics packs.
+let _metricsOf = fn(raw: Bytes): Metrics {
+  {
+    audioBytesSent: raw.readI64Le(0),
+    audioPacketsSent: raw.readI64Le(8),
+    audioBytesReceived: raw.readI64Le(16),
+    audioPacketsReceived: raw.readI64Le(24),
+    videoBytesSent: raw.readI64Le(32),
+    videoFramesSent: raw.readI64Le(40),
+    videoBytesReceived: raw.readI64Le(48),
+    videoFramesReceived: raw.readI64Le(56),
+    messagesSent: raw.readI64Le(64),
+    messagesReceived: raw.readI64Le(72),
+  }
+};
+
+let _audioTag = fn(codec: AudioCodec): I32 {
+  match (codec) { None => 0, Opus => 1, Pcma => 2, Pcmu => 3 }
+};
+
+let _videoTag = fn(codec: VideoCodec): I32 {
+  match (codec) { None => 0, H264 => 1 }
+};
+
+let _channelTag = fn(channel: DataChannel): I32 {
+  match (channel) { None => 0, Text => 1, Binary => 2 }
+};
+
+/* The ICE servers as the native library takes them: a URL, a username and a
+ * credential for each, each ending in a zero byte. Servers it cannot use throw. */
+let _iceServers = fn(servers: Array<IceServer>): Bytes {
+  if (servers.len() > maxIceServers) {
+    throw `Peer.init: a peer takes at most ${maxIceServers} ICE servers`;
+  }
+  let packed = "";
+  for (server in servers) {
+    let url = server.url;
+    if (!url.startsWith("stun:") && !url.startsWith("turn:")) {
+      throw `Peer.init: the ICE server ${url} is not a stun: or turn: URL`;
+    }
+    if (url.substring(5, url.len()).indexOf(":") < 1) {
+      throw `Peer.init: the ICE server ${url} has no host and port`;
+    }
+    let text = url + server.username + server.credential;
+    if (text.contains("\x00")) { throw `Peer.init: the ICE server ${url} holds a zero byte`; }
+    packed = packed + url + "\x00" + server.username + "\x00" + server.credential + "\x00";
+  }
+  packed
+};
+
+/* A WebRTC peer. Closing a peer frees it at once; a closed peer traps when
+ * used. An unclosed peer is freed when it is collected, but a peer that is
+ * signalling over MQTT should be closed, so that it leaves the broker. */
+export typedef Peer = { let handle: Handle; let config: Config; };
+export prototype Peer {
+  // A peer with CONFIG, or the defaults.
+  init(?config: Config) {
+    let chosen = config ?? defaults();
+    let servers = _iceServers(chosen.iceServers);
+    this.config = chosen;
+    let channel = _channelTag(chosen.channel);
+    this.handle = _new(_audioTag(chosen.audio), _videoTag(chosen.video), channel, servers);
+  };
+
+  // Closes the peer, and its signalling, now; closing twice does nothing.
+  close(): Null { _close(this.handle); null };
+
+  // The state of the peer's connection.
+  state(): State { _stateOf(_state(this.handle)) };
+
+  /* An offer: the peer's local description, with its candidates. Gathering
+   * them asks each ICE server, so this waits on the network when the peer
+   * has ICE servers. */
+  createOffer(): Bytes { _offer(this.handle) };
+
+  /* An answer to the remote offer, which setRemoteDescription must have set,
+   * with the peer's candidates; the peer then starts checking candidate pairs. */
+  createAnswer(): Bytes { _answer(this.handle) };
+
+  /* Sets the remote peer's description, an offer or an answer; an answer
+   * starts the checks of candidate pairs. Lines may end in "\r\n" or "\n".
+   * A description libpeer refuses throws, changing nothing: one with a
+   * malformed candidate or fingerprint, a field longer than libpeer keeps, or
+   * more remote candidates than libpeer keeps, 32 since the last offer. */
+  setRemoteDescription(sdp: Bytes, kind: SdpType): Peer {
+    let problem = _setRemote(this.handle, sdp, kind == SdpType.Answer ? 1 : 0);
+    if (problem != "") { throw `Peer.setRemoteDescription: ${problem}`; }
+    this
+  };
+
+  /* Adds a candidate of the remote peer, as "candidate:..." or
+   * "a=candidate:..."; an empty one, which ends the candidates, adds nothing.
+   * One libpeer cannot read or use throws, as does a 33rd. Only UDP
+   * candidates are used. */
+  addIceCandidate(candidate: Bytes): Peer {
+    let problem = _addCandidate(this.handle, candidate);
+    if (problem != "") { throw `Peer.addIceCandidate: ${problem}`; }
+    this
+  };
+
+  /* Sends an encoded audio packet, such as one Opus frame or 20 ms of G.711;
+   * whether it went, which it does only once the peer is Completed. A peer
+   * without audio, or a packet longer than maxAudioPacket, throws. */
+  sendAudio(packet: Bytes): Bool {
+    if (this.config.audio == AudioCodec.None) {
+      throw "Peer.sendAudio: the peer has no audio codec";
+    }
+    if (packet.len() > maxAudioPacket) {
+      throw `Peer.sendAudio: the packet is longer than ${maxAudioPacket} bytes`;
+    }
+    _sendAudio(this.handle, packet)
+  };
+
+  /* Sends an encoded video frame, H.264 NAL units with start codes; whether it
+   * went, which it does only once the peer is Completed. A peer without video
+   * throws. */
+  sendVideo(frame: Bytes): Bool {
+    if (this.config.video == VideoCodec.None) {
+      throw "Peer.sendVideo: the peer has no video codec";
+    }
+    _sendVideo(this.handle, frame)
+  };
+
+  /* Sends a message on a stream of the data channel, 0 by default; whether it
+   * went, which it does only once the data channel is open. A peer without a
+   * data channel throws. */
+  send(data: Bytes, stream: I32 = 0): Bool {
+    if (this.config.channel == DataChannel.None) {
+      throw "Peer.send: the peer has no data channel";
+    }
+    _send(this.handle, data, stream)
+  };
+
+  /* Asks the remote peer to open a data channel named LABEL on a stream, 0 by
+   * default; whether the request went, which it does only once the data
+   * channel is connected. A peer without a data channel throws. */
+  openChannel(label: Bytes, stream: I32 = 0): Bool {
+    if (this.config.channel == DataChannel.None) {
+      throw "Peer.openChannel: the peer has no data channel";
+    }
+    _openChannel(this.handle, label, stream)
+  };
+
+  /* Runs the peer, and its MQTT signalling if it has it, until it has events
+   * or TIMEOUT milliseconds have passed, 0 by default for one turn; the events
+   * since the last poll, oldest first. A peer keeps the last 4096 events; poll
+   * often enough, or an Event.Dropped says how many were lost. The DTLS
+   * handshake may hold a poll for some seconds past its timeout. */
+  poll(timeout: I32 = 0): Array<Event> { _events(_poll(this.handle, timeout)) };
+
+  // What the peer has sent and received.
+  metrics(): Metrics { _metricsOf(_metrics(this.handle)) };
+
+  /* Signals for the peer at URL, with an optional TOKEN. For WHIP, posts the
+   * peer's offer to the endpoint, with the token as a bearer token, and sets
+   * the answer; throws when no answer comes. For MQTT, connects to the broker
+   * and waits on the URL's path, its topic, for offers, which poll answers;
+   * the token is Base64 of "username:password". Only one peer at a time can
+   * signal over MQTT: another's signal throws until it stops. Signalling always
+   * uses TLS, and throws unless the server's certificate is trusted for its
+   * host; it also throws when the server cannot be reached or refuses. */
+  signal(url: Bytes, token: Bytes = ""): Peer {
+    if (protocol(url) == null) {
+      throw "Peer.signal: the URL must start with mqtt://, mqtts://, http:// or https://";
+    }
+    let problem = _signal(this.handle, url, token);
+    if (problem != "") { throw `Peer.signal: ${problem}`; }
+    this
+  };
+
+  // Ends the peer's MQTT signalling session, leaving the broker; does nothing without one.
+  stopSignalling(): Null { _unsignal(this.handle); null };
+};

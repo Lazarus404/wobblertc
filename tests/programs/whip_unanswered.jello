@@ -1,0 +1,10 @@
+// expect: Peer.signal: cannot connect to the server
+// expect: Peer.signal: cannot connect to the server
+// A WHIP endpoint that refuses the connection makes signal throw, saying so; and a failed signal
+// leaves no session behind, so the next, at another URL, is tried in its turn.
+import { Peer } from wobblertc.Peer;
+
+let attempt = fn(url: Bytes): Bytes {
+  try { new Peer().signal(url); "signalled" } catch (e) { e as Bytes }
+};
+attempt("https://127.0.0.1:1/whip") + "\n" + attempt("https://127.0.0.1:2/whip")

@@ -1,0 +1,55 @@
+package wobblertc;
+
+import type { Test } from std.testing;
+import std.testing as T;
+import { OpusMode, opusToc, opusFrameMicros } from wobblertc.Codecs;
+
+let testOpusTocOfEmptyPacket = fn(t: Test) {
+  T.isNull(t, opusToc(""));
+  null
+};
+
+let testOpusToc = fn(t: Test) {
+  let toc = opusToc("\xf8\x01\x02");
+  T.isTrue(t, toc != null);
+  if (toc != null) {
+    T.equal(t, toc.config, 31);
+    T.equal(t, toc.mode, OpusMode.Celt);
+    T.equal(t, toc.stereo, false);
+    T.equal(t, toc.frameCode, 0);
+  }
+  let silk = opusToc("\x0f");
+  if (silk != null) {
+    T.equal(t, silk.config, 1);
+    T.equal(t, silk.mode, OpusMode.Silk);
+    T.equal(t, silk.stereo, true);
+    T.equal(t, silk.frameCode, 3);
+  }
+  let hybrid = opusToc("\x62");
+  if (hybrid != null) {
+    T.equal(t, hybrid.config, 12);
+    T.equal(t, hybrid.mode, OpusMode.Hybrid);
+    T.equal(t, hybrid.frameCode, 2);
+  }
+  null
+};
+
+let testOpusFrameCodes = fn(t: Test) {
+  let codes = Array.new<I32>(0);
+  for (byte in ["\x00", "\x01", "\x02", "\x03"]) {
+    let toc = opusToc(byte);
+    codes.push(toc == null ? -1 : toc.frameCode);
+  }
+  T.equal(t, Std.string(codes), "[0, 1, 2, 3]");
+  null
+};
+
+let testOpusFrameMicros = fn(t: Test) {
+  T.equal(t, opusFrameMicros(0), 10000);
+  T.equal(t, opusFrameMicros(3), 60000);
+  T.equal(t, opusFrameMicros(12), 10000);
+  T.equal(t, opusFrameMicros(15), 20000);
+  T.equal(t, opusFrameMicros(16), 2500);
+  T.equal(t, opusFrameMicros(31), 20000);
+  null
+};

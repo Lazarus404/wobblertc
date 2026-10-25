@@ -1,0 +1,3 @@
+[submodule "jdll/third_party/libpeer"]
+	path = jdll/third_party/libpeer
+	url = https://github.com/sepfy/libpeer.git

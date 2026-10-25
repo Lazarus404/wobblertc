@@ -1,0 +1,8 @@
+{
+  "name": "wobblertc",
+  "version": "0.1.0",
+  "description": "WebRTC peers for Jello, on libpeer: WHIP and MQTT signalling, Opus, PCMA and PCMU audio, H.264 video and data channels",
+  "dev_dependencies": {
+    "degust": {"github": "Lazarus404/degust", "tag": "0.1.0"}
+  }
+}

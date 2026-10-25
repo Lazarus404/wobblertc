@@ -1,0 +1,17 @@
+package wobblertc;
+
+/* Signalling: how two peers swap their descriptions. libpeer speaks two
+ * protocols, chosen by the URL's scheme: MQTT (mqtt:// or mqtts://), where a
+ * peer waits on a broker's topic for offers, and WHIP (http:// or https://),
+ * where a peer posts its offer to an endpoint and takes the answer. Peer's
+ * signal method starts either. */
+
+// A signalling protocol.
+export enum Protocol { Mqtt; Whip; }
+
+// The protocol a signalling URL's scheme names; null for any other URL.
+export let protocol = fn(url: Bytes): ?Protocol {
+  if (url.startsWith("mqtt://") || url.startsWith("mqtts://")) { return Protocol.Mqtt; }
+  if (url.startsWith("http://") || url.startsWith("https://")) { return Protocol.Whip; }
+  null
+};

@@ -1,0 +1,22 @@
+package wobblertc;
+
+/* What a peer has sent and received: bytes of encoded media, and packets,
+ * frames or messages. Sent counts only what went; received counts what
+ * arrived from the remote peer. */
+export typedef Metrics = {
+  let audioBytesSent: I64;
+  let audioPacketsSent: I64;
+  let audioBytesReceived: I64;
+  let audioPacketsReceived: I64;
+  let videoBytesSent: I64;
+  let videoFramesSent: I64;
+  let videoBytesReceived: I64;
+  let videoFramesReceived: I64;
+  let messagesSent: I64;
+  let messagesReceived: I64;
+};
+
+// The rate of BYTES over MILLIS milliseconds, in kilobits a second; 0 when no time has passed.
+export let kbps = fn(bytes: I64, millis: I64): F64 {
+  millis <= 0i64 ? 0.0 : (bytes * 8i64) as F64 / millis as F64
+};
